@@ -1,14 +1,16 @@
 import argparse
 import ast
 import json
+import os
 import re
 
 import pandas as pd
-import weaviate
 
+from constants import NEAR_TEXT_DISTANCE
+from utils import get_local_weaviate_client, get_cloud_weaviate_client
 from weaviate.classes.config import Configure, DataType, Property
 
-CARDS_CSV_PATH = "all_mtg_cards.csv"
+CARDS_CSV_PATH = "data/all_mtg_cards.csv"
 
 COLOUR_MAP = {
     "W": "white",
@@ -95,36 +97,57 @@ def _describe_hybrid_part(part):
     return part
 
 
-def create_cards_collection(client, should_recreate=False):
+PROPERTIES = [
+    Property(name="name", data_type=DataType.TEXT),
+    Property(name="mana_cost", data_type=DataType.TEXT, skip_vectorization=True),
+    Property(name="mana_cost_text_expanded", data_type=DataType.TEXT),
+    Property(name="colors", data_type=DataType.TEXT_ARRAY),
+    Property(name="color_identity", data_type=DataType.TEXT_ARRAY),
+    Property(name="type", data_type=DataType.TEXT),
+    Property(name="subtypes", data_type=DataType.TEXT_ARRAY),
+    Property(name="rarity", data_type=DataType.TEXT),
+    Property(name="text", data_type=DataType.TEXT),
+    Property(name="flavor", data_type=DataType.TEXT),
+    Property(name="number", data_type=DataType.NUMBER, skip_vectorization=True),
+    Property(name="power", data_type=DataType.INT),
+    Property(name="toughness", data_type=DataType.INT),
+    Property(name="loyalty", data_type=DataType.TEXT),
+    # TODO parse legalities into an array of objects
+    Property(name="legalities", data_type=DataType.TEXT, skip_vectorization=True), 
+    Property(name="image_url", data_type=DataType.TEXT, skip_vectorization=True),
+]
+
+
+def create_local_cards_collection(client, should_recreate=False):
 
     if client.collections.exists("Cards") and should_recreate:
         client.collections.delete("Cards")
 
     client.collections.create(
         name="Cards",
-        properties=[
-            Property(name="name", data_type=DataType.TEXT),
-            Property(name="mana_cost", data_type=DataType.TEXT, skip_vectorization=True),
-            Property(name="mana_cost_text_expanded", data_type=DataType.TEXT),
-            Property(name="colors", data_type=DataType.TEXT_ARRAY),
-            Property(name="color_identity", data_type=DataType.TEXT_ARRAY),
-            Property(name="type", data_type=DataType.TEXT),
-            Property(name="subtypes", data_type=DataType.TEXT_ARRAY),
-            Property(name="rarity", data_type=DataType.TEXT),
-            Property(name="text", data_type=DataType.TEXT),
-            Property(name="flavor", data_type=DataType.TEXT),
-            Property(name="number", data_type=DataType.NUMBER, skip_vectorization=True),
-            Property(name="power", data_type=DataType.TEXT),
-            Property(name="toughness", data_type=DataType.TEXT),
-            Property(name="loyalty", data_type=DataType.TEXT),
-            # TODO parse legalities into an array of objects
-            Property(name="legalities", data_type=DataType.TEXT, skip_vectorization=True), 
-            Property(name="image_url", data_type=DataType.TEXT, skip_vectorization=True),
-        ],
+        properties=PROPERTIES,
         vector_config=Configure.Vectors.text2vec_ollama(
             api_endpoint="http://host.docker.internal:11434",
             model="nomic-embed-text",
         ),
+    )
+
+
+def create_cloud_cards_collection(client, should_recreate=False):
+
+    if client.collections.exists("Cards") and should_recreate:
+        client.collections.delete("Cards")
+
+    client.collections.create(
+        name="Cards",
+        properties=PROPERTIES,
+        vector_config=[
+            Configure.Vectors.text2vec_weaviate(
+                name="title_vector",
+                source_properties=["title"],
+                model="Snowflake/snowflake-arctic-embed-l-v2.0"
+            )
+        ],
     )
 
 
@@ -149,7 +172,7 @@ def query_cards(client, query):
     response = cards.query.near_text(
         query=query,
         limit=3,
-        distance=0.5
+        distance=NEAR_TEXT_DISTANCE
     )
     return response
 
@@ -170,8 +193,8 @@ def preprocess_card_row(row):
         "text": row["text"],
         "flavor": row["flavor"] if pd.notna(row["flavor"]) else None,
         "number": int(row["number"]) if pd.notna(row["number"]) else None,
-        "power": row["power"] if pd.notna(row["power"]) else None,
-        "toughness": row["toughness"] if pd.notna(row["toughness"]) else None,
+        "power": int(row["power"]) if pd.notna(row["power"]) else None,
+        "toughness": int(row["toughness"]) if pd.notna(row["toughness"]) else None,
         "loyalty": str(row["loyalty"]) if pd.notna(row["loyalty"]) else None,
         "legalities": row["legalities"],
         "image_url": row["image_url"],
@@ -179,7 +202,7 @@ def preprocess_card_row(row):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MTG semantic search tools")
+    parser = argparse.ArgumentParser(description="MTG semantic search management tools")
     parser.add_argument("--query", type=str, help="Run a semantic search with the given query text")
     parser.add_argument(
         "--build-db",
@@ -187,20 +210,31 @@ def main():
         help="Rebuild the card collection in Weaviate using local card data",
     )
     parser.add_argument("--num-cards", type=int, help="Number of cards to add to the collection", default=None)
+    parser.add_argument(
+        "--client",
+        choices=["local", "cloud"],
+        default="local",
+        help="Select whether to connect to a local or cloud Weaviate instance",
+    )
 
     args = parser.parse_args()
 
     if not args.build_db and not args.query:
         parser.error("at least one of --build-db or --query must be provided")
 
-    client = weaviate.connect_to_local(
-        host="weaviate",
-        port=8080,
-    )
+    client = None
 
     try:
+        if args.client == "local":
+            client = get_local_weaviate_client()
+        else:
+            client = get_cloud_weaviate_client()
+
         if args.build_db:
-            create_cards_collection(client, should_recreate=True)
+            if args.client == "local":
+                create_local_cards_collection(client, should_recreate=True)
+            else:
+                create_cloud_cards_collection(client, should_recreate=True)
             add_cards_to_collection(client, num_cards=args.num_cards)
 
         if args.query:
@@ -208,7 +242,8 @@ def main():
             for obj in response.objects:
                 print(json.dumps(obj.properties, indent=2))
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 if __name__ == "__main__":

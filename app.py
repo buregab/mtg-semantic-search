@@ -1,21 +1,32 @@
-from flask import Flask, request, jsonify, render_template_string
-import weaviate
-import os
+import argparse
+import atexit
 import logging
+import os
+
+from flask import Flask, request, jsonify, render_template_string
+
+from constants import NEAR_TEXT_DISTANCE
+from utils import get_local_weaviate_client, get_cloud_weaviate_client
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.config["WEAVIATE_CLIENT_MODE"] = os.getenv("WEAVIATE_CLIENT_MODE", "local")
+app.weaviate_client = None
 
-# Weaviate connection
-WEAVIATE_HOST = os.getenv('WEAVIATE_HOST', 'weaviate')
-WEAVIATE_PORT = os.getenv('WEAVIATE_PORT', 8080)
 
 def get_weaviate_client():
-    """Get Weaviate client connection"""
-    return weaviate.connect_to_local(host=WEAVIATE_HOST, port=WEAVIATE_PORT)
+    """Select the configured Weaviate client."""
+    client = getattr(app, "weaviate_client", None)
+    if client is not None:
+        return client
+
+    mode = app.config.get("WEAVIATE_CLIENT_MODE", "local")
+    app.weaviate_client = initialize_weaviate_client(mode)
+    return app.weaviate_client
+
 
 @app.route('/')
 def index():
@@ -128,25 +139,20 @@ def search_cards():
         
         # Connect to Weaviate and search
         client = get_weaviate_client()
+        cards = client.collections.use("Cards")
+        response = cards.query.near_text(
+            query=query,
+            limit=5,
+            distance=NEAR_TEXT_DISTANCE
+        )
         
-        try:
-            cards = client.collections.use("Cards")
-            response = cards.query.near_text(
-                query=query,
-                limit=5,
-                distance=0.7
-            )
-            
-            # Format results
-            results = []
-            for obj in response.objects:
-                card_data = obj.properties
-                results.append(card_data)
-            
-            return jsonify(results)
-            
-        finally:
-            client.close()
+        # Format results
+        results = []
+        for obj in response.objects:
+            card_data = obj.properties
+            results.append(card_data)
+        
+        return jsonify(results)
             
     except Exception as e:
         logger.error(f"Search error: {str(e)}", exc_info=True)
@@ -157,12 +163,51 @@ def health():
     """Health check endpoint"""
     try:
         client = get_weaviate_client()
-        client.close()
         return jsonify({'status': 'healthy', 'weaviate': 'connected'})
     except Exception as e:
         logger.error(f"Health check error: {str(e)}", exc_info=True)
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
+def initialize_weaviate_client(mode: str):
+    if mode == "cloud":
+        return get_cloud_weaviate_client()
+    if mode == "local":
+        return get_local_weaviate_client()
+    raise RuntimeError(f"Unsupported client mode: {mode}")
+
+
+def close_weaviate_client():
+    client = getattr(app, "weaviate_client", None)
+    if client is not None:
+        try:
+            client.close()
+        except Exception as exc:
+            logger.warning(f"Failed to close Weaviate client cleanly: {exc}")
+        finally:
+            app.weaviate_client = None
+
+
+atexit.register(close_weaviate_client)
+
+
 if __name__ == '__main__':
-    logger.info(f"Starting Flask app on port 5000")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    parser = argparse.ArgumentParser(description="MTG semantic search web app")
+    parser.add_argument(
+        "--client",
+        choices=["local", "cloud"],
+        default=app.config.get("WEAVIATE_CLIENT_MODE", "local"),
+        help="Select whether to connect to a local or cloud Weaviate instance",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug mode",
+    )
+    args = parser.parse_args()
+
+    app.config["WEAVIATE_CLIENT_MODE"] = args.client
+    app.weaviate_client = initialize_weaviate_client(args.client)
+
+    logger.info(f"Starting Flask app on port 5000 using {args.client} client (debug={args.debug})")
+    app.run(host='0.0.0.0', port=5000, debug=args.debug)
